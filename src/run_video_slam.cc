@@ -1,9 +1,6 @@
 #ifdef HAVE_PANGOLIN_VIEWER
 #include "pangolin_viewer/viewer.h"
 #endif
-#ifdef HAVE_IRIDESCENCE_VIEWER
-#include "iridescence_viewer/viewer.h"
-#endif
 #ifdef HAVE_SOCKET_PUBLISHER
 #include "socket_publisher/publisher.h"
 #endif
@@ -27,6 +24,7 @@
 
 #include <ghc/filesystem.hpp>
 namespace fs = ghc::filesystem;
+using namespace std;
 
 #ifdef USE_STACK_TRACE_LOGGER
 #include <backward.hpp>
@@ -35,6 +33,13 @@ namespace fs = ghc::filesystem;
 #ifdef USE_GOOGLE_PERFTOOLS
 #include <gperftools/profiler.h>
 #endif
+
+struct Frame_list
+{
+    cv::Mat frame; //vector
+    double id;    //vector
+};
+
 
 int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
                   const std::shared_ptr<stella_vslam::config>& cfg,
@@ -64,45 +69,6 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
             slam->get_map_publisher());
     }
 #endif
-#ifdef HAVE_IRIDESCENCE_VIEWER
-    std::shared_ptr<iridescence_viewer::viewer> iridescence_viewer;
-    std::mutex mtx_pause;
-    bool is_paused = false;
-    std::mutex mtx_terminate;
-    bool terminate_is_requested = false;
-    std::mutex mtx_step;
-    unsigned int step_count = 0;
-    if (viewer_string == "iridescence_viewer") {
-        iridescence_viewer = std::make_shared<iridescence_viewer::viewer>(
-            stella_vslam::util::yaml_optional_ref(cfg->yaml_node_, "IridescenceViewer"),
-            slam->get_frame_publisher(),
-            slam->get_map_publisher());
-        iridescence_viewer->add_checkbox("Pause", [&is_paused, &mtx_pause](bool check) {
-            std::lock_guard<std::mutex> lock(mtx_pause);
-            is_paused = check;
-        });
-        iridescence_viewer->add_button("Step", [&step_count, &mtx_step] {
-            std::lock_guard<std::mutex> lock(mtx_step);
-            step_count++;
-        });
-        iridescence_viewer->add_button("Reset", [&is_paused, &mtx_pause, &slam] {
-            slam->request_reset();
-        });
-        iridescence_viewer->add_button("Save and exit", [&is_paused, &mtx_pause, &terminate_is_requested, &mtx_terminate, &slam, &iridescence_viewer] {
-            std::lock_guard<std::mutex> lock1(mtx_pause);
-            is_paused = false;
-            std::lock_guard<std::mutex> lock2(mtx_terminate);
-            terminate_is_requested = true;
-            iridescence_viewer->request_terminate();
-        });
-        iridescence_viewer->add_close_callback([&is_paused, &mtx_pause, &terminate_is_requested, &mtx_terminate] {
-            std::lock_guard<std::mutex> lock1(mtx_pause);
-            is_paused = false;
-            std::lock_guard<std::mutex> lock2(mtx_terminate);
-            terminate_is_requested = true;
-        });
-    }
-#endif
 #ifdef HAVE_SOCKET_PUBLISHER
     std::shared_ptr<socket_publisher::publisher> publisher;
     if (viewer_string == "socket_publisher") {
@@ -123,6 +89,8 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
     std::vector<double> track_times;
 
     cv::Mat frame;
+    Frame_list list;
+
 
     unsigned int num_frame = 0;
     double timestamp = start_timestamp;
@@ -130,26 +98,7 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
     bool is_not_end = true;
     // run the slam in another thread
     std::thread thread([&]() {
-        while (is_not_end) {
-#ifdef HAVE_IRIDESCENCE_VIEWER
-            while (true) {
-                {
-                    std::lock_guard<std::mutex> lock(mtx_pause);
-                    if (!is_paused) {
-                        break;
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(mtx_step);
-                    if (step_count > 0) {
-                        step_count--;
-                        break;
-                    }
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds(5000));
-            }
-#endif
-
+        while (is_not_end) { // video end && list empty
             // wait until the loop BA is finished
             if (wait_loop_ba) {
                 while (slam->loop_BA_is_running() || !slam->mapping_module_is_enabled()) {
@@ -157,13 +106,17 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
                 }
             }
 
-            is_not_end = video.read(frame);
+            is_not_end = video.read(frame); // read img
+            list.frame = frame;
+            list.id = timestamp;
+            //cout<<list.id<<endl; // show id
+
 
             const auto tp_1 = std::chrono::steady_clock::now();
 
-            if (!frame.empty() && (num_frame % frame_skip == 0)) {
+            if (!list.frame.empty() && (num_frame % frame_skip == 0)) {
                 // input the current frame and estimate the camera pose
-                slam->feed_monocular_frame(frame, timestamp, mask);
+                slam->feed_monocular_frame(list.frame, timestamp, mask);
             }
 
             const auto tp_2 = std::chrono::steady_clock::now();
@@ -184,23 +137,14 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
             timestamp += 1.0 / slam->get_camera()->fps_;
             ++num_frame;
 
-#ifdef HAVE_IRIDESCENCE_VIEWER
-            // check if the termination of slam system is requested or not
-            {
-                std::lock_guard<std::mutex> lock(mtx_terminate);
-                if (terminate_is_requested) {
-                    break;
-                }
-            }
-#else
             // check if the termination of slam system is requested or not
             if (slam->terminate_is_requested()) {
                 break;
             }
-#endif
         }
 
-        // wait until the loop BA is finished
+        // wait until the loop BA is finished,
+        //
         while (slam->loop_BA_is_running()) {
             std::this_thread::sleep_for(std::chrono::microseconds(5000));
         }
@@ -210,11 +154,6 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
             if (viewer_string == "pangolin_viewer") {
 #ifdef HAVE_PANGOLIN_VIEWER
                 viewer->request_terminate();
-#endif
-            }
-            if (viewer_string == "iridescence_viewer") {
-#ifdef HAVE_IRIDESCENCE_VIEWER
-                iridescence_viewer->request_terminate();
 #endif
             }
             if (viewer_string == "socket_publisher") {
@@ -231,11 +170,6 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
         viewer->run();
 #endif
     }
-    if (viewer_string == "iridescence_viewer") {
-#ifdef HAVE_IRIDESCENCE_VIEWER
-        iridescence_viewer->run();
-#endif
-    }
     if (viewer_string == "socket_publisher") {
 #ifdef HAVE_SOCKET_PUBLISHER
         publisher->run();
@@ -246,11 +180,12 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
 
     // shutdown the slam process
     slam->shutdown();
-
+    
     if (!eval_log_dir.empty()) {
         // output the trajectories for evaluation
         slam->save_frame_trajectory(eval_log_dir + "/frame_trajectory.txt", "TUM");
         slam->save_keyframe_trajectory(eval_log_dir + "/keyframe_trajectory.txt", "TUM");
+        slam->save_map_points_with_keyframe_pose(eval_log_dir + "/map_database.txt");
         // output the tracking times for evaluation
         std::ofstream ofs(eval_log_dir + "/track_times.txt", std::ios::out);
         if (ofs.is_open()) {
