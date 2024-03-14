@@ -244,6 +244,7 @@ int mono_tracking(const std::shared_ptr<stella_vslam::system>& slam,
         // output the trajectories for evaluation
         slam->save_frame_trajectory(eval_log_dir + "/frame_trajectory.txt", "TUM");
         slam->save_keyframe_trajectory(eval_log_dir + "/keyframe_trajectory.txt", "TUM");
+        slam->save_map_points_with_keyframe_pose(eval_log_dir + "/map_database.txt");
         // output the tracking times for evaluation
         std::ofstream ofs(eval_log_dir + "/track_times.txt", std::ios::out);
         if (ofs.is_open()) {
